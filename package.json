@@ -2,14 +2,7 @@
   "name": "scritchlow-calendar",
   "version": "1.0.0",
   "type": "module",
-  "private": true,
-  "scripts": {
-    "dev": "node --watch api/index.js",
-    "start": "node api/index.js"
-  },
   "dependencies": {
-    "dayjs": "^1.11.11",
-    "express": "^4.19.2",
     "googleapis": "^131.0.0"
   }
 }
