@@ -1,0 +1,10 @@
+{
+  "name": "retell-gcal-booking",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "dayjs": "^1.11.13",
+    "express": "^4.19.2",
+    "googleapis": "^131.0.0"
+  }
+}

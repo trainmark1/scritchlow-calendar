@@ -1,0 +1,11 @@
+node_modules/
+.vercel/
+.env
+.env.*
+*.log
+*.pem
+*.p12
+*.key
+.DS_Store
+
+*calendar-bot*.json
