@@ -1,6 +1,4 @@
-// api/index.js
 import express from "express";
-import serverless from "serverless-http";
 import { google } from "googleapis";
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc.js";
@@ -12,35 +10,39 @@ dayjs.extend(tz);
 const app = express();
 app.use(express.json());
 
-/* -------------------- CONFIG -------------------- */
-// Set these in Vercel → Project → Settings → Environment Variables
-// - DEFAULT_CALENDAR_ID        e.g. markinerfausto@gmail.com
-// - DEFAULT_TZ                 e.g. America/Chicago
-// - API_SECRET                 (optional) shared key for X-API-Key
-// - GOOGLE_CLIENT_EMAIL        from your service account JSON
-// - GOOGLE_PRIVATE_KEY         from the JSON (keep line breaks; replace \n back)
-const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID;
+/* ============= CONFIG (from env) ============= */
+const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID || ""; // e.g. you@gmail.com
 const DEFAULT_TZ = process.env.DEFAULT_TZ || "America/Chicago";
-const API_SECRET = process.env.API_SECRET || "";
+const API_SECRET = process.env.API_SECRET || ""; // required if set
 
-/* -------------------- HELPERS -------------------- */
+/* ============= MIDDLEWARE ============= */
 function requireSecret(req, res, next) {
-  if (!API_SECRET) return next(); // open if not set
+  if (!API_SECRET) return next(); // if no secret is configured, leave open
   if (req.headers["x-api-key"] === API_SECRET) return next();
   return res.status(401).json({ error: "unauthorized" });
 }
 
+/* ============= GOOGLE AUTH ============= */
 function getAuth() {
-  // IMPORTANT: keep line breaks in private key
-  const pk = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+  const clientEmail = process.env.GOOGLE_CLIENT_EMAIL;
+  let privateKey = process.env.GOOGLE_PRIVATE_KEY || "";
+
+  if (!privateKey || !clientEmail) {
+    throw new Error("Google credentials missing. Set GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY.");
+  }
+
+  // Convert literal "\n" to real newlines
+  privateKey = privateKey.replace(/\\n/g, "\n");
+
   return new google.auth.JWT(
-    process.env.GOOGLE_CLIENT_EMAIL,
+    clientEmail,
     null,
-    pk,
+    privateKey,
     ["https://www.googleapis.com/auth/calendar"]
   );
 }
 
+/* ============= HELPERS ============= */
 function toISO(v) {
   if (!v) return undefined;
   if (/^\d{13}$/.test(String(v))) return new Date(Number(v)).toISOString(); // epoch ms
@@ -48,42 +50,35 @@ function toISO(v) {
 }
 
 /**
- * Find free slots using FreeBusy within business hours.
- * @param {Object} params
- * @param {string} params.calendarId
- * @param {string} params.fromISO  UTC ISO
- * @param {string} params.toISO    UTC ISO
- * @param {string} params.tz       IANA TZ
- * @param {number} params.durationMin
- * @param {number} params.maxSlots
+ * Find free slots using FreeBusy combined with a business-hours window.
  */
 async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots }) {
   const auth = getAuth();
   const calendar = google.calendar({ version: "v3", auth });
 
-  // Busy blocks in range
+  // Pull busy blocks
   const fb = await calendar.freebusy.query({
     requestBody: {
       timeMin: fromISO,
       timeMax: toISO,
       timeZone: tz,
-      items: [{ id: calendarId }],
-    },
+      items: [{ id: calendarId }]
+    }
   });
 
   const busy = (fb.data.calendars?.[calendarId]?.busy || [])
     .map(b => ({ start: b.start, end: b.end }))
     .sort((a, b) => new Date(a.start) - new Date(b.start));
 
-  // Business hours (local time)
-  const workStart = "09:00"; // 9AM
-  const workEnd   = "17:00"; // 5PM
+  // Business hours (local)
+  const workStart = "09:00"; // 9 AM local
+  const workEnd   = "17:00"; // 5 PM local
 
   const slots = [];
   let cursor = dayjs(fromISO);
-  const rangeEnd = dayjs(toISO);
+  const end = dayjs(toISO);
 
-  while (cursor.isBefore(rangeEnd) && slots.length < maxSlots) {
+  while (cursor.isBefore(end) && slots.length < maxSlots) {
     const dayLocal = cursor.tz(tz);
     const dayStart = dayjs.tz(`${dayLocal.format("YYYY-MM-DD")}T${workStart}`, tz).utc();
     const dayEnd   = dayjs.tz(`${dayLocal.format("YYYY-MM-DD")}T${workEnd}`, tz).utc();
@@ -91,15 +86,15 @@ async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots
     if (dayEnd.isAfter(dayjs(fromISO))) {
       let windowStart = dayStart;
 
-      // Busy blocks intersecting this work day
+      // Busy periods that intersect the work day
       const todaysBusy = busy.filter(
         b => dayjs(b.end).isAfter(dayStart) && dayjs(b.start).isBefore(dayEnd)
       );
 
-      // Fill gaps before each busy block
+      // Gaps before each busy block
       for (const b of todaysBusy) {
         const bStart = dayjs(b.start);
-        const bEnd   = dayjs(b.end);
+        const bEnd = dayjs(b.end);
 
         if (bStart.isAfter(windowStart)) {
           let slotStart = windowStart;
@@ -117,7 +112,7 @@ async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots
         if (slots.length >= maxSlots) break;
       }
 
-      // Fill remainder to dayEnd
+      // Remaining time to dayEnd
       if (slots.length < maxSlots && windowStart.isBefore(dayEnd)) {
         let slotStart = windowStart;
         while (slotStart.add(durationMin, "minute").isSameOrBefore(dayEnd)) {
@@ -137,31 +132,46 @@ async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots
   return slots;
 }
 
-/* -------------------- ROUTES (mounted under /api/* on Vercel) -------------------- */
+/* ============= ROUTES ============= */
 
-// Healthcheck → GET /api/health
-app.get("/health", (_, res) => res.json({ ok: true }));
+// Healthcheck
+app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// Free slots → GET /api/free-slots?calendarId=&from=&to=&tz=&duration=30&limit=12
-app.get("/free-slots", requireSecret, async (req, res) => {
+// Debug environment (PROTECTED)
+app.get("/api/debug-env", requireSecret, (req, res) => {
+  const keyRaw = process.env.GOOGLE_PRIVATE_KEY || "";
+  res.json({
+    hasEmail: !!process.env.GOOGLE_CLIENT_EMAIL,
+    keyLen: keyRaw.length,
+    startsWith: keyRaw.slice(0, 30).replace(/\n/g, "\\n"),
+    hasEscapedN: keyRaw.includes("\\n"),
+    defaultCal: DEFAULT_CALENDAR_ID,
+    defaultTz: DEFAULT_TZ
+  });
+});
+
+// GET /api/free-slots?calendarId=&from=&to=&tz=&duration=30&limit=12
+app.get("/api/free-slots", requireSecret, async (req, res) => {
   try {
-    const calendarId  = req.query.calendarId || DEFAULT_CALENDAR_ID;
-    const tz          = req.query.tz || DEFAULT_TZ;
-    const durationMin = Number(req.query.duration || 30);
-    const limit       = Number(req.query.limit || 12);
-
-    const fromISO = toISO(req.query.from) || dayjs().utc().startOf("day").toISOString();
-    const toISOv  = toISO(req.query.to)   || dayjs().utc().add(14, "day").endOf("day").toISOString();
-
+    const calendarId = req.query.calendarId || DEFAULT_CALENDAR_ID;
     if (!calendarId) return res.status(400).json({ error: "missing calendarId" });
+
+    const tz = req.query.tz || DEFAULT_TZ;
+    const durationMin = Number(req.query.duration || 30);
+    const limit = Number(req.query.limit || 12);
+
+    const fromISO =
+      toISO(req.query.from) || dayjs().utc().startOf("day").toISOString();
+    const toISOVal =
+      toISO(req.query.to) || dayjs().utc().add(14, "day").endOf("day").toISOString();
 
     const slots = await findSlots({
       calendarId,
       fromISO,
-      toISO: toISOv,
+      toISO: toISOVal,
       tz,
       durationMin,
-      maxSlots: limit,
+      maxSlots: limit
     });
 
     res.json({ slots, tz, durationMin });
@@ -171,9 +181,8 @@ app.get("/free-slots", requireSecret, async (req, res) => {
   }
 });
 
-// Book appointment → POST /api/book
-// Body: { calendarId, start, end, tz, summary, description, attendees:[{email,name}] }
-app.post("/book", requireSecret, async (req, res) => {
+// POST /api/book  { calendarId, start, end, tz, summary, description, attendees:[{email,name}] }
+app.post("/api/book", requireSecret, async (req, res) => {
   try {
     const {
       calendarId = DEFAULT_CALENDAR_ID,
@@ -182,7 +191,7 @@ app.post("/book", requireSecret, async (req, res) => {
       tz = DEFAULT_TZ,
       summary = "Financial Planning Consultation",
       description = "",
-      attendees = [], // optional
+      attendees = []
     } = req.body;
 
     if (!calendarId || !start || !end) {
@@ -201,8 +210,8 @@ app.post("/book", requireSecret, async (req, res) => {
         start: { dateTime: toISO(start), timeZone: tz },
         end:   { dateTime: toISO(end),   timeZone: tz },
         attendees,
-        reminders: { useDefault: true },
-      },
+        reminders: { useDefault: true }
+      }
     });
 
     res.json({ ok: true, event: event.data });
@@ -212,5 +221,4 @@ app.post("/book", requireSecret, async (req, res) => {
   }
 });
 
-/* -------------------- Vercel handler -------------------- */
-export default serverless(app);
+export default app;
