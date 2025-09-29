@@ -11,35 +11,59 @@ dayjs.extend(tz);
 const app = express();
 app.use(express.json());
 
-/* -------------------- CONFIG -------------------- */
-const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID; // e.g. markinerfausto@gmail.com
+/* ======================= CONFIG ======================= */
+const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID || "";
 const DEFAULT_TZ = process.env.DEFAULT_TZ || "America/Chicago"; // Bloomington, IL (Central Time)
-const API_SECRET = process.env.API_SECRET || ""; // optional shared secret
+const API_SECRET = process.env.API_SECRET || "";                 // require x-api-key if set
 
+// 9 AM – 5 PM local business window
+const WORK_START = "09:00";
+const WORK_END   = "17:00";
+
+// helper: API key guard
 function requireSecret(req, res, next) {
-  if (!API_SECRET) return next(); // not set → open
-  if (req.headers["x-api-key"] === API_SECRET) return next();
+  if (!API_SECRET) return next();
+  const given = req.headers["x-api-key"];
+  if (given && given === API_SECRET) return next();
   return res.status(401).json({ error: "unauthorized" });
 }
 
+// helper: Google auth (service account)
 function getAuth() {
-  const pk = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+  const raw = process.env.GOOGLE_PRIVATE_KEY || "";
+  // Accept either multiline or \n-escaped
+  const key = raw.includes("\n") ? raw : raw.replace(/\\n/g, "\n");
+
   return new google.auth.JWT(
     process.env.GOOGLE_CLIENT_EMAIL,
     null,
-    pk,
+    key,
     ["https://www.googleapis.com/auth/calendar"]
   );
 }
 
+// helper: normalize to ISO
 function toISO(v) {
   if (!v) return undefined;
-  if (/^\d{13}$/.test(String(v))) return new Date(Number(v)).toISOString();
+  if (/^\d{13}$/.test(String(v))) return new Date(Number(v)).toISOString(); // epoch ms
   return new Date(v).toISOString();
 }
 
+// helper: human labels for the bot (always Central Time)
+function labelSlot(startISO, endISO, tz = DEFAULT_TZ) {
+  const s = dayjs(startISO).tz(tz);
+  const e = dayjs(endISO).tz(tz);
+  // e.g. Thu Sep 26, 10:00–10:30 AM Central Time
+  const dayPart = s.format("ddd MMM D");
+  const timePart = `${s.format("h:mm A")}–${e.format("h:mm A")}`;
+  return `${dayPart}, ${timePart} Central Time`;
+}
+
+/* =================== FREE SLOTS CORE =================== */
 /**
- * Find free slots within given window & working hours.
+ * Finds free slots using Calendar FreeBusy + 9–5 local window.
+ * durationMin: minutes per slot
+ * maxSlots: cap how many to return
  */
 async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots }) {
   const auth = getAuth();
@@ -55,28 +79,28 @@ async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots
   });
 
   const busy = (fb.data.calendars?.[calendarId]?.busy || [])
-    .map((b) => ({ start: b.start, end: b.end }))
+    .map(b => ({ start: b.start, end: b.end }))
     .sort((a, b) => new Date(a.start) - new Date(b.start));
 
-  const workStart = "09:00"; // 9 AM local
-  const workEnd = "17:00";   // 5 PM local
-
-  const slots = [];
+  const results = [];
   let cursor = dayjs(fromISO);
-  const end = dayjs(toISO);
+  const hardEnd = dayjs(toISO);
 
-  while (cursor.isBefore(end) && slots.length < maxSlots) {
-    const dayLocal = cursor.tz(tz);
-    const dayStart = dayjs.tz(`${dayLocal.format("YYYY-MM-DD")}T${workStart}`, tz).utc();
-    const dayEnd = dayjs.tz(`${dayLocal.format("YYYY-MM-DD")}T${workEnd}`, tz).utc();
+  while (cursor.isBefore(hardEnd) && results.length < maxSlots) {
+    // daily 9–5 window in TZ, compared in UTC
+    const localDay = cursor.tz(tz);
+    const dayStart = dayjs.tz(`${localDay.format("YYYY-MM-DD")}T${WORK_START}`, tz).utc();
+    const dayEnd   = dayjs.tz(`${localDay.format("YYYY-MM-DD")}T${WORK_END}`, tz).utc();
 
     if (dayEnd.isAfter(dayjs(fromISO))) {
       let windowStart = dayStart;
 
-      const todaysBusy = busy.filter(
-        (b) => dayjs(b.end).isAfter(dayStart) && dayjs(b.start).isBefore(dayEnd)
+      // relevant busy blocks for this day
+      const todaysBusy = busy.filter(b =>
+        dayjs(b.end).isAfter(dayStart) && dayjs(b.start).isBefore(dayEnd)
       );
 
+      // slots before the first busy, then between busy blocks
       for (const b of todaysBusy) {
         const bStart = dayjs(b.start);
         const bEnd = dayjs(b.end);
@@ -86,24 +110,33 @@ async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots
           while (slotStart.add(durationMin, "minute").isSameOrBefore(bStart)) {
             const slotEnd = slotStart.add(durationMin, "minute");
             if (slotStart.isAfter(dayjs())) {
-              slots.push({ start: slotStart.toISOString(), end: slotEnd.toISOString() });
-              if (slots.length >= maxSlots) break;
+              results.push({
+                start: slotStart.toISOString(),
+                end: slotEnd.toISOString(),
+                label: labelSlot(slotStart.toISOString(), slotEnd.toISOString(), tz),
+              });
+              if (results.length >= maxSlots) break;
             }
             slotStart = slotStart.add(durationMin, "minute");
           }
         }
 
         if (bEnd.isAfter(windowStart)) windowStart = bEnd;
-        if (slots.length >= maxSlots) break;
+        if (results.length >= maxSlots) break;
       }
 
-      if (slots.length < maxSlots && windowStart.isBefore(dayEnd)) {
+      // tail after last busy
+      if (results.length < maxSlots && windowStart.isBefore(dayEnd)) {
         let slotStart = windowStart;
         while (slotStart.add(durationMin, "minute").isSameOrBefore(dayEnd)) {
           const slotEnd = slotStart.add(durationMin, "minute");
           if (slotStart.isAfter(dayjs())) {
-            slots.push({ start: slotStart.toISOString(), end: slotEnd.toISOString() });
-            if (slots.length >= maxSlots) break;
+            results.push({
+              start: slotStart.toISOString(),
+              end: slotEnd.toISOString(),
+              label: labelSlot(slotStart.toISOString(), slotEnd.toISOString(), tz),
+            });
+            if (results.length >= maxSlots) break;
           }
           slotStart = slotStart.add(durationMin, "minute");
         }
@@ -113,78 +146,100 @@ async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots
     cursor = cursor.add(1, "day");
   }
 
-  return slots;
+  return results;
 }
 
-/* -------------------- ROUTES -------------------- */
+/* ======================= ROUTES ======================== */
 
-// Healthcheck
-app.get("/health", (_, res) => res.json({ ok: true }));
+// Health
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, ts: Date.now() });
+});
 
 // Free slots
-app.get("/free-slots", requireSecret, async (req, res) => {
+// Query params supported:
+// - calendarId: string (default DEFAULT_CALENDAR_ID)
+// - tz: IANA tz (default America/Chicago)
+// - duration: minutes (default 30)
+// - limit: how many slots to return (default 5)
+// - range: "week" | "month" | "custom" (default "week")
+// - from, to: ISO strings; if both given, override range
+app.get("/api/free-slots", requireSecret, async (req, res) => {
   try {
-    const calendarId  = req.query.calendarId || DEFAULT_CALENDAR_ID;
-    const tz          = req.query.tz || DEFAULT_TZ;
+    const calendarId = (req.query.calendarId || DEFAULT_CALENDAR_ID).toString();
+    const tz = (req.query.tz || DEFAULT_TZ).toString();
     const durationMin = Number(req.query.duration || 30);
-    const limit       = Math.min(Number(req.query.limit || 12), 200);
-    const range       = (req.query.range || "month").toLowerCase(); // default = month
+    const limit = Number(req.query.limit || 5);
+    const range = (req.query.range || "week").toString(); // week | month | custom
 
     if (!calendarId) return res.status(400).json({ error: "missing calendarId" });
 
-    const nowLocal = dayjs().tz(tz).startOf("day");
-    let fromISO = nowLocal.utc().toISOString();
-    let toISOVal;
+    // Build time window
+    let fromISO = toISO(req.query.from);
+    let toISOv  = toISO(req.query.to);
 
-    if (range === "week") {
-      toISOVal = nowLocal.add(7, "day").endOf("day").utc().toISOString();
-    } else if (range === "fortnight") {
-      toISOVal = nowLocal.add(14, "day").endOf("day").utc().toISOString();
-    } else if (range === "month") {
-      toISOVal = nowLocal.endOf("month").endOf("day").utc().toISOString();
-    } else if (range === "custom") {
-      const f = toISO(req.query.from);
-      const t = toISO(req.query.to);
-      if (!f || !t) return res.status(400).json({ error: "for range=custom you must supply from & to" });
-      fromISO = f;
-      toISOVal = t;
-    } else {
-      toISOVal = nowLocal.endOf("month").endOf("day").utc().toISOString();
+    const now = dayjs().tz(tz);
+    if (!fromISO || !toISOv) {
+      const start = now.add(15, "minute"); // avoid too-near-now
+      let end;
+      if (range === "month") {
+        end = start.add(1, "month").endOf("day");
+      } else if (range === "custom") {
+        // fall back to 14 days if custom requested without explicit from/to
+        end = start.add(14, "day").endOf("day");
+      } else {
+        // default: week
+        end = start.add(7, "day").endOf("day");
+      }
+      fromISO = start.utc().toISOString();
+      toISOv  = end.utc().toISOString();
     }
 
-    const slotsRaw = await findSlots({
+    // Guard bad windows
+    if (dayjs(toISOv).isSameOrBefore(dayjs(fromISO))) {
+      return res.status(400).json({ error: "invalid window: to must be after from" });
+    }
+
+    const slots = await findSlots({
       calendarId,
       fromISO,
-      toISO: toISOVal,
+      toISO: toISOv,
       tz,
       durationMin,
-      maxSlots: limit * 4,
+      maxSlots: limit,
     });
-
-    const nowUtc = dayjs().utc().add(1, "minute");
-    const slots = slotsRaw
-      .filter((s) => dayjs(s.start).isAfter(nowUtc))
-      .sort((a, b) => new Date(a.start) - new Date(b.start))
-      .slice(0, limit)
-      .map((s) => ({
-        ...s,
-        label: dayjs(s.start).tz(tz).format("dddd, MMMM D, h:mm A [Central Time]"),
-      }));
 
     res.json({
-      slots,
       tz,
       durationMin,
-      window: { fromISO, toISO: toISOVal, range },
+      range,
+      from: fromISO,
+      to: toISOv,
+      count: slots.length,
+      slots,                       // [{start, end, label}]
+      labels: slots.map(s => s.label), // convenience for quick prompts
     });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message || "free-slots error" });
+    console.error("free-slots error:", e?.response?.data || e?.message || e);
+    res.status(502).json({
+      error: "free-slots failed",
+      detail: e?.response?.data || e?.message || "unknown",
+    });
   }
 });
 
-// Book appointment
-app.post("/book", requireSecret, async (req, res) => {
+// Book
+// Body JSON:
+// {
+//   "calendarId": "optional (defaults to DEFAULT_CALENDAR_ID)",
+//   "start": "<ISO>",
+//   "end": "<ISO>",
+//   "tz": "America/Chicago",              // default
+//   "summary": "Financial Planning Consultation",
+//   "description": "",
+//   "attendees": [ { "email": "", "name": "" } ]  // optional; service accounts often cannot invite externally
+// }
+app.post("/api/book", requireSecret, async (req, res) => {
   try {
     const {
       calendarId = DEFAULT_CALENDAR_ID,
@@ -194,7 +249,7 @@ app.post("/book", requireSecret, async (req, res) => {
       summary = "Financial Planning Consultation",
       description = "",
       attendees = [],
-    } = req.body;
+    } = req.body || {};
 
     if (!calendarId || !start || !end) {
       return res.status(400).json({ error: "calendarId, start, end are required" });
@@ -211,15 +266,21 @@ app.post("/book", requireSecret, async (req, res) => {
         description,
         start: { dateTime: toISO(start), timeZone: tz },
         end: { dateTime: toISO(end), timeZone: tz },
-        attendees,
+        attendees, // NOTE: many service accounts can't invite externals—ok to leave empty
         reminders: { useDefault: true },
       },
     });
 
-    res.json({ ok: true, event: event.data });
+    res.json({
+      ok: true,
+      event: event.data,
+    });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message || "book error" });
+    console.error("book error:", e?.response?.data || e?.message || e);
+    res.status(502).json({
+      error: "book failed",
+      detail: e?.response?.data || e?.message || "unknown",
+    });
   }
 });
 
