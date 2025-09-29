@@ -1,5 +1,11 @@
+import dayjs from "dayjs";
+import utc from "dayjs/plugin/utc.js";
+import tz from "dayjs/plugin/timezone.js";
 import { google } from "googleapis";
 import { getAuth, toISO, findSlots } from "./_lib.js";
+
+dayjs.extend(utc);
+dayjs.extend(tz);
 
 const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID;
 const DEFAULT_TZ = process.env.DEFAULT_TZ || "America/Chicago";
@@ -16,11 +22,18 @@ export default async function handler(req, res) {
     const durationMin = Number(req.query.duration || 30);
     const limit       = Number(req.query.limit || 12);
 
-    const now = new Date();
-    const fromISO = toISO(req.query.from) || new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
-    const toISOv  = toISO(req.query.to)   || new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()+14, 23,59,59)).toISOString();
-
     if (!calendarId) return res.status(400).json({ error: "missing calendarId" });
+
+    // Rolling window: start-of-today in Central → end-of-day +14 days, unless caller overrides
+    let fromISO = toISO(req.query.from);
+    let toISOv  = toISO(req.query.to);
+
+    if (!fromISO || !toISOv) {
+      const startLocal = dayjs().tz(tz).startOf("day");
+      const endLocal   = startLocal.add(14, "day").endOf("day"); // adjust window length as needed
+      fromISO = startLocal.utc().toISOString();
+      toISOv  = endLocal.utc().toISOString();
+    }
 
     const slots = await findSlots({
       google, calendarId, fromISO, toISO: toISOv, tz, durationMin, maxSlots: limit

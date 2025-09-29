@@ -16,7 +16,7 @@ export default async function handler(req, res) {
       calendarId = DEFAULT_CALENDAR_ID,
       start,
       end,
-      tz = DEFAULT_TZ,
+      tz = DEFAULT_TZ,                                        // default to Central Time
       summary = "Financial Planning Consultation",
       description = "",
       attendees = []

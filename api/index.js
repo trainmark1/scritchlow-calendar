@@ -11,13 +11,13 @@ const app = express();
 app.use(express.json());
 
 /* ============= CONFIG (from env) ============= */
-const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID || ""; // e.g. you@gmail.com
-const DEFAULT_TZ = process.env.DEFAULT_TZ || "America/Chicago";
-const API_SECRET = process.env.API_SECRET || ""; // required if set
+const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID || "";           // e.g. you@gmail.com
+const DEFAULT_TZ = process.env.DEFAULT_TZ || "America/Chicago";              // Central Time (Bloomington, IL)
+const API_SECRET = process.env.API_SECRET || "";                              // optional shared secret
 
 /* ============= MIDDLEWARE ============= */
 function requireSecret(req, res, next) {
-  if (!API_SECRET) return next(); // if no secret is configured, leave open
+  if (!API_SECRET) return next();                      // if no secret is configured, leave open
   if (req.headers["x-api-key"] === API_SECRET) return next();
   return res.status(401).json({ error: "unauthorized" });
 }
@@ -51,6 +51,8 @@ function toISO(v) {
 
 /**
  * Find free slots using FreeBusy combined with a business-hours window.
+ * - Respects local working hours (09:00–17:00 in the requested tz)
+ * - Filters out slots that start in the past (relative to now)
  */
 async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots }) {
   const auth = getAuth();
@@ -137,7 +139,7 @@ async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots
 // Healthcheck
 app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// Debug environment (PROTECTED)
+// Debug environment (protected)
 app.get("/api/debug-env", requireSecret, (req, res) => {
   const keyRaw = process.env.GOOGLE_PRIVATE_KEY || "";
   res.json({
@@ -151,6 +153,7 @@ app.get("/api/debug-env", requireSecret, (req, res) => {
 });
 
 // GET /api/free-slots?calendarId=&from=&to=&tz=&duration=30&limit=12
+// Always starts "today" in Central Time unless caller overrides from/to
 app.get("/api/free-slots", requireSecret, async (req, res) => {
   try {
     const calendarId = req.query.calendarId || DEFAULT_CALENDAR_ID;
@@ -160,10 +163,16 @@ app.get("/api/free-slots", requireSecret, async (req, res) => {
     const durationMin = Number(req.query.duration || 30);
     const limit = Number(req.query.limit || 12);
 
-    const fromISO =
-      toISO(req.query.from) || dayjs().utc().startOf("day").toISOString();
-    const toISOVal =
-      toISO(req.query.to) || dayjs().utc().add(14, "day").endOf("day").toISOString();
+    // Rolling window: from start-of-today (Central) to end-of-day +14 days
+    let fromISO = toISO(req.query.from);
+    let toISOVal = toISO(req.query.to);
+
+    if (!fromISO || !toISOVal) {
+      const startLocal = dayjs().tz(tz).startOf("day");
+      const endLocal   = startLocal.add(14, "day").endOf("day"); // change 14 to 7 or 30 if you prefer
+      fromISO = startLocal.utc().toISOString();
+      toISOVal = endLocal.utc().toISOString();
+    }
 
     const slots = await findSlots({
       calendarId,
@@ -188,7 +197,7 @@ app.post("/api/book", requireSecret, async (req, res) => {
       calendarId = DEFAULT_CALENDAR_ID,
       start,
       end,
-      tz = DEFAULT_TZ,
+      tz = DEFAULT_TZ,                                      // always Central by default
       summary = "Financial Planning Consultation",
       description = "",
       attendees = []
