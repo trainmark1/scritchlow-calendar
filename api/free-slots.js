@@ -1,58 +1,34 @@
-// GET /api/free-slots?range=week|fortnight|month|custom
-app.get("/free-slots", requireSecret, async (req, res) => {
+import { google } from "googleapis";
+import { getAuth, toISO, findSlots } from "./_lib.js";
+
+const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID;
+const DEFAULT_TZ = process.env.DEFAULT_TZ || "America/Chicago";
+const API_SECRET = process.env.API_SECRET || "";
+
+export default async function handler(req, res) {
   try {
+    if (API_SECRET && req.headers["x-api-key"] !== API_SECRET) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+
     const calendarId  = req.query.calendarId || DEFAULT_CALENDAR_ID;
     const tz          = req.query.tz || DEFAULT_TZ;
     const durationMin = Number(req.query.duration || 30);
-    const limit       = Math.min(Number(req.query.limit || 12), 200);
-    const range       = (req.query.range || "fortnight").toLowerCase();
+    const limit       = Number(req.query.limit || 12);
+
+    const now = new Date();
+    const fromISO = toISO(req.query.from) || new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
+    const toISOv  = toISO(req.query.to)   || new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()+14, 23,59,59)).toISOString();
 
     if (!calendarId) return res.status(400).json({ error: "missing calendarId" });
 
-    // Always start from "today" in local tz
-    const nowLocal = dayjs().tz(tz).startOf("day");
-    let fromISO = nowLocal.utc().toISOString();
-    let toISOVal;
-
-    if (range === "week") {
-      toISOVal = nowLocal.add(7, "day").endOf("day").utc().toISOString();
-    } else if (range === "fortnight") {
-      toISOVal = nowLocal.add(14, "day").endOf("day").utc().toISOString();
-    } else if (range === "month") {
-      toISOVal = nowLocal.endOf("month").endOf("day").utc().toISOString();
-    } else if (range === "custom") {
-      const f = toISO(req.query.from);
-      const t = toISO(req.query.to);
-      if (!f || !t) return res.status(400).json({ error: "for range=custom you must supply from & to" });
-      fromISO = f;
-      toISOVal = t;
-    } else {
-      toISOVal = nowLocal.add(14, "day").endOf("day").utc().toISOString();
-    }
-
-    const slotsRaw = await findSlots({
-      calendarId,
-      fromISO,
-      toISO: toISOVal,
-      tz,
-      durationMin,
-      maxSlots: limit * 4
+    const slots = await findSlots({
+      google, calendarId, fromISO, toISO: toISOv, tz, durationMin, maxSlots: limit
     });
 
-    const nowUtc = dayjs().utc().add(1, "minute");
-    const slots = slotsRaw
-      .filter(s => dayjs(s.start).isAfter(nowUtc))
-      .sort((a, b) => new Date(a.start) - new Date(b.start))
-      .slice(0, limit);
-
-    res.json({
-      slots,
-      tz,
-      durationMin,
-      window: { fromISO, toISO: toISOVal, range }
-    });
+    res.status(200).json({ slots, tz, durationMin });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message || "free-slots error" });
   }
-});
+}

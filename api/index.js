@@ -1,4 +1,3 @@
-// api/index.js
 import express from "express";
 import { google } from "googleapis";
 import dayjs from "dayjs";
@@ -11,96 +10,88 @@ dayjs.extend(tz);
 const app = express();
 app.use(express.json());
 
-/* ======================= CONFIG ======================= */
-const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID || "";
-const DEFAULT_TZ = process.env.DEFAULT_TZ || "America/Chicago"; // Bloomington, IL (Central Time)
-const API_SECRET = process.env.API_SECRET || "";                 // require x-api-key if set
+/* ============= CONFIG (from env) ============= */
+const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID || ""; // e.g. you@gmail.com
+const DEFAULT_TZ = process.env.DEFAULT_TZ || "America/Chicago";
+const API_SECRET = process.env.API_SECRET || ""; // required if set
 
-// 9 AM – 5 PM local business window
-const WORK_START = "09:00";
-const WORK_END   = "17:00";
-
-// helper: API key guard
+/* ============= MIDDLEWARE ============= */
 function requireSecret(req, res, next) {
-  if (!API_SECRET) return next();
-  const given = req.headers["x-api-key"];
-  if (given && given === API_SECRET) return next();
+  if (!API_SECRET) return next(); // if no secret is configured, leave open
+  if (req.headers["x-api-key"] === API_SECRET) return next();
   return res.status(401).json({ error: "unauthorized" });
 }
 
-// helper: Google auth (service account)
+/* ============= GOOGLE AUTH ============= */
 function getAuth() {
-  const raw = process.env.GOOGLE_PRIVATE_KEY || "";
-  // Accept either multiline or \n-escaped
-  const key = raw.includes("\n") ? raw : raw.replace(/\\n/g, "\n");
+  const clientEmail = process.env.GOOGLE_CLIENT_EMAIL;
+  let privateKey = process.env.GOOGLE_PRIVATE_KEY || "";
+
+  if (!privateKey || !clientEmail) {
+    throw new Error("Google credentials missing. Set GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY.");
+  }
+
+  // Convert literal "\n" to real newlines
+  privateKey = privateKey.replace(/\\n/g, "\n");
 
   return new google.auth.JWT(
-    process.env.GOOGLE_CLIENT_EMAIL,
+    clientEmail,
     null,
-    key,
+    privateKey,
     ["https://www.googleapis.com/auth/calendar"]
   );
 }
 
-// helper: normalize to ISO
+/* ============= HELPERS ============= */
 function toISO(v) {
   if (!v) return undefined;
   if (/^\d{13}$/.test(String(v))) return new Date(Number(v)).toISOString(); // epoch ms
   return new Date(v).toISOString();
 }
 
-// helper: human labels for the bot (always Central Time)
-function labelSlot(startISO, endISO, tz = DEFAULT_TZ) {
-  const s = dayjs(startISO).tz(tz);
-  const e = dayjs(endISO).tz(tz);
-  // e.g. Thu Sep 26, 10:00–10:30 AM Central Time
-  const dayPart = s.format("ddd MMM D");
-  const timePart = `${s.format("h:mm A")}–${e.format("h:mm A")}`;
-  return `${dayPart}, ${timePart} Central Time`;
-}
-
-/* =================== FREE SLOTS CORE =================== */
 /**
- * Finds free slots using Calendar FreeBusy + 9–5 local window.
- * durationMin: minutes per slot
- * maxSlots: cap how many to return
+ * Find free slots using FreeBusy combined with a business-hours window.
  */
 async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots }) {
   const auth = getAuth();
   const calendar = google.calendar({ version: "v3", auth });
 
+  // Pull busy blocks
   const fb = await calendar.freebusy.query({
     requestBody: {
       timeMin: fromISO,
       timeMax: toISO,
       timeZone: tz,
-      items: [{ id: calendarId }],
-    },
+      items: [{ id: calendarId }]
+    }
   });
 
   const busy = (fb.data.calendars?.[calendarId]?.busy || [])
     .map(b => ({ start: b.start, end: b.end }))
     .sort((a, b) => new Date(a.start) - new Date(b.start));
 
-  const results = [];
-  let cursor = dayjs(fromISO);
-  const hardEnd = dayjs(toISO);
+  // Business hours (local)
+  const workStart = "09:00"; // 9 AM local
+  const workEnd   = "17:00"; // 5 PM local
 
-  while (cursor.isBefore(hardEnd) && results.length < maxSlots) {
-    // daily 9–5 window in TZ, compared in UTC
-    const localDay = cursor.tz(tz);
-    const dayStart = dayjs.tz(`${localDay.format("YYYY-MM-DD")}T${WORK_START}`, tz).utc();
-    const dayEnd   = dayjs.tz(`${localDay.format("YYYY-MM-DD")}T${WORK_END}`, tz).utc();
+  const slots = [];
+  let cursor = dayjs(fromISO);
+  const end = dayjs(toISO);
+
+  while (cursor.isBefore(end) && slots.length < maxSlots) {
+    const dayLocal = cursor.tz(tz);
+    const dayStart = dayjs.tz(`${dayLocal.format("YYYY-MM-DD")}T${workStart}`, tz).utc();
+    const dayEnd   = dayjs.tz(`${dayLocal.format("YYYY-MM-DD")}T${workEnd}`, tz).utc();
 
     if (dayEnd.isAfter(dayjs(fromISO))) {
       let windowStart = dayStart;
 
-      // relevant busy blocks for this day
-      const todaysBusy = busy.filter(b =>
-        dayjs(b.end).isAfter(dayStart) && dayjs(b.start).isBefore(dayEnd)
+      // Busy periods that intersect the work day
+      const todaysBusy = busy.filter(
+        b => dayjs(b.end).isAfter(dayStart) && dayjs(b.start).isBefore(dayEnd)
       );
 
-      // slots before the first busy, then between busy blocks
+      // Gaps before each busy block
       for (const b of todaysBusy) {
         const bStart = dayjs(b.start);
         const bEnd = dayjs(b.end);
@@ -110,33 +101,25 @@ async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots
           while (slotStart.add(durationMin, "minute").isSameOrBefore(bStart)) {
             const slotEnd = slotStart.add(durationMin, "minute");
             if (slotStart.isAfter(dayjs())) {
-              results.push({
-                start: slotStart.toISOString(),
-                end: slotEnd.toISOString(),
-                label: labelSlot(slotStart.toISOString(), slotEnd.toISOString(), tz),
-              });
-              if (results.length >= maxSlots) break;
+              slots.push({ start: slotStart.toISOString(), end: slotEnd.toISOString() });
+              if (slots.length >= maxSlots) break;
             }
             slotStart = slotStart.add(durationMin, "minute");
           }
         }
 
         if (bEnd.isAfter(windowStart)) windowStart = bEnd;
-        if (results.length >= maxSlots) break;
+        if (slots.length >= maxSlots) break;
       }
 
-      // tail after last busy
-      if (results.length < maxSlots && windowStart.isBefore(dayEnd)) {
+      // Remaining time to dayEnd
+      if (slots.length < maxSlots && windowStart.isBefore(dayEnd)) {
         let slotStart = windowStart;
         while (slotStart.add(durationMin, "minute").isSameOrBefore(dayEnd)) {
           const slotEnd = slotStart.add(durationMin, "minute");
           if (slotStart.isAfter(dayjs())) {
-            results.push({
-              start: slotStart.toISOString(),
-              end: slotEnd.toISOString(),
-              label: labelSlot(slotStart.toISOString(), slotEnd.toISOString(), tz),
-            });
-            if (results.length >= maxSlots) break;
+            slots.push({ start: slotStart.toISOString(), end: slotEnd.toISOString() });
+            if (slots.length >= maxSlots) break;
           }
           slotStart = slotStart.add(durationMin, "minute");
         }
@@ -146,99 +129,59 @@ async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots
     cursor = cursor.add(1, "day");
   }
 
-  return results;
+  return slots;
 }
 
-/* ======================= ROUTES ======================== */
+/* ============= ROUTES ============= */
 
-// Health
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, ts: Date.now() });
+// Healthcheck
+app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// Debug environment (PROTECTED)
+app.get("/api/debug-env", requireSecret, (req, res) => {
+  const keyRaw = process.env.GOOGLE_PRIVATE_KEY || "";
+  res.json({
+    hasEmail: !!process.env.GOOGLE_CLIENT_EMAIL,
+    keyLen: keyRaw.length,
+    startsWith: keyRaw.slice(0, 30).replace(/\n/g, "\\n"),
+    hasEscapedN: keyRaw.includes("\\n"),
+    defaultCal: DEFAULT_CALENDAR_ID,
+    defaultTz: DEFAULT_TZ
+  });
 });
 
-// Free slots
-// Query params supported:
-// - calendarId: string (default DEFAULT_CALENDAR_ID)
-// - tz: IANA tz (default America/Chicago)
-// - duration: minutes (default 30)
-// - limit: how many slots to return (default 5)
-// - range: "week" | "month" | "custom" (default "week")
-// - from, to: ISO strings; if both given, override range
+// GET /api/free-slots?calendarId=&from=&to=&tz=&duration=30&limit=12
 app.get("/api/free-slots", requireSecret, async (req, res) => {
   try {
-    const calendarId = (req.query.calendarId || DEFAULT_CALENDAR_ID).toString();
-    const tz = (req.query.tz || DEFAULT_TZ).toString();
-    const durationMin = Number(req.query.duration || 30);
-    const limit = Number(req.query.limit || 5);
-    const range = (req.query.range || "week").toString(); // week | month | custom
-
+    const calendarId = req.query.calendarId || DEFAULT_CALENDAR_ID;
     if (!calendarId) return res.status(400).json({ error: "missing calendarId" });
 
-    // Build time window
-    let fromISO = toISO(req.query.from);
-    let toISOv  = toISO(req.query.to);
+    const tz = req.query.tz || DEFAULT_TZ;
+    const durationMin = Number(req.query.duration || 30);
+    const limit = Number(req.query.limit || 12);
 
-    const now = dayjs().tz(tz);
-    if (!fromISO || !toISOv) {
-      const start = now.add(15, "minute"); // avoid too-near-now
-      let end;
-      if (range === "month") {
-        end = start.add(1, "month").endOf("day");
-      } else if (range === "custom") {
-        // fall back to 14 days if custom requested without explicit from/to
-        end = start.add(14, "day").endOf("day");
-      } else {
-        // default: week
-        end = start.add(7, "day").endOf("day");
-      }
-      fromISO = start.utc().toISOString();
-      toISOv  = end.utc().toISOString();
-    }
-
-    // Guard bad windows
-    if (dayjs(toISOv).isSameOrBefore(dayjs(fromISO))) {
-      return res.status(400).json({ error: "invalid window: to must be after from" });
-    }
+    const fromISO =
+      toISO(req.query.from) || dayjs().utc().startOf("day").toISOString();
+    const toISOVal =
+      toISO(req.query.to) || dayjs().utc().add(14, "day").endOf("day").toISOString();
 
     const slots = await findSlots({
       calendarId,
       fromISO,
-      toISO: toISOv,
+      toISO: toISOVal,
       tz,
       durationMin,
-      maxSlots: limit,
+      maxSlots: limit
     });
 
-    res.json({
-      tz,
-      durationMin,
-      range,
-      from: fromISO,
-      to: toISOv,
-      count: slots.length,
-      slots,                       // [{start, end, label}]
-      labels: slots.map(s => s.label), // convenience for quick prompts
-    });
+    res.json({ slots, tz, durationMin });
   } catch (e) {
-    console.error("free-slots error:", e?.response?.data || e?.message || e);
-    res.status(502).json({
-      error: "free-slots failed",
-      detail: e?.response?.data || e?.message || "unknown",
-    });
+    console.error(e);
+    res.status(500).json({ error: e.message || "free-slots error" });
   }
 });
 
-// Book
-// Body JSON:
-// {
-//   "calendarId": "optional (defaults to DEFAULT_CALENDAR_ID)",
-//   "start": "<ISO>",
-//   "end": "<ISO>",
-//   "tz": "America/Chicago",              // default
-//   "summary": "Financial Planning Consultation",
-//   "description": "",
-//   "attendees": [ { "email": "", "name": "" } ]  // optional; service accounts often cannot invite externally
-// }
+// POST /api/book  { calendarId, start, end, tz, summary, description, attendees:[{email,name}] }
 app.post("/api/book", requireSecret, async (req, res) => {
   try {
     const {
@@ -248,8 +191,8 @@ app.post("/api/book", requireSecret, async (req, res) => {
       tz = DEFAULT_TZ,
       summary = "Financial Planning Consultation",
       description = "",
-      attendees = [],
-    } = req.body || {};
+      attendees = []
+    } = req.body;
 
     if (!calendarId || !start || !end) {
       return res.status(400).json({ error: "calendarId, start, end are required" });
@@ -265,22 +208,16 @@ app.post("/api/book", requireSecret, async (req, res) => {
         summary,
         description,
         start: { dateTime: toISO(start), timeZone: tz },
-        end: { dateTime: toISO(end), timeZone: tz },
-        attendees, // NOTE: many service accounts can't invite externals—ok to leave empty
-        reminders: { useDefault: true },
-      },
+        end:   { dateTime: toISO(end),   timeZone: tz },
+        attendees,
+        reminders: { useDefault: true }
+      }
     });
 
-    res.json({
-      ok: true,
-      event: event.data,
-    });
+    res.json({ ok: true, event: event.data });
   } catch (e) {
-    console.error("book error:", e?.response?.data || e?.message || e);
-    res.status(502).json({
-      error: "book failed",
-      detail: e?.response?.data || e?.message || "unknown",
-    });
+    console.error(e);
+    res.status(500).json({ error: e.message || "book error" });
   }
 });
 

@@ -1,6 +1,17 @@
-// Book appointment
-app.post("/book", requireSecret, async (req, res) => {
+import { google } from "googleapis";
+import { getAuth, toISO } from "./_lib.js";
+
+const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID;
+const DEFAULT_TZ = process.env.DEFAULT_TZ || "America/Chicago";
+const API_SECRET = process.env.API_SECRET || "";
+
+export default async function handler(req, res) {
   try {
+    if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
+    if (API_SECRET && req.headers["x-api-key"] !== API_SECRET) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+
     const {
       calendarId = DEFAULT_CALENDAR_ID,
       start,
@@ -8,8 +19,8 @@ app.post("/book", requireSecret, async (req, res) => {
       tz = DEFAULT_TZ,
       summary = "Financial Planning Consultation",
       description = "",
-      attendees = [],
-    } = req.body;
+      attendees = []
+    } = req.body || {};
 
     if (!calendarId || !start || !end) {
       return res.status(400).json({ error: "calendarId, start, end are required" });
@@ -25,22 +36,15 @@ app.post("/book", requireSecret, async (req, res) => {
         summary,
         description,
         start: { dateTime: toISO(start), timeZone: tz },
-        end: { dateTime: toISO(end), timeZone: tz },
+        end:   { dateTime: toISO(end),   timeZone: tz },
         attendees,
         reminders: { useDefault: true },
-      },
+      }
     });
 
-    // Format a friendly label
-    const label = dayjs(start).tz(tz).format("dddd, MMMM D, h:mm A [Central Time]");
-
-    res.json({
-      ok: true,
-      event: event.data,
-      label,
-    });
+    res.status(200).json({ ok: true, event: event.data });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message || "book error" });
   }
-});
+}
