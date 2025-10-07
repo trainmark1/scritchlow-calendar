@@ -17,7 +17,7 @@ export default async function handler(req, res) {
       start,
       end,
       tz = DEFAULT_TZ,                                        // default to Central Time
-      summary = "Financial Planning Consultation",
+      summary = "The Scritchlow Agency Consultation",
       description = "",
       attendees = []
     } = req.body || {};

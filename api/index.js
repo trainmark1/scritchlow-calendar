@@ -198,7 +198,7 @@ app.post("/api/book", requireSecret, async (req, res) => {
       start,
       end,
       tz = DEFAULT_TZ,
-      summary = "Financial Planning Consultation",
+      summary = "The Scritchlow Agency Consultation",
       description = ""
     } = req.body || {};
 
