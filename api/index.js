@@ -1,3 +1,4 @@
+// index.js
 import express from "express";
 import { google } from "googleapis";
 import dayjs from "dayjs";
@@ -10,49 +11,53 @@ dayjs.extend(tz);
 const app = express();
 app.use(express.json());
 
-/* ============= CONFIG ============= */
-const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID || "";           // e.g. you@gmail.com
-const DEFAULT_TZ          = process.env.DEFAULT_TZ || "America/Chicago";     // Central Time
-const API_SECRET          = process.env.API_SECRET || "";                    // optional shared secret
+/* ========= ENV / CONFIG =========
+Required env vars (example .env at bottom):
 
-/* ============= MIDDLEWARE ============= */
-function requireSecret(req, _res, next) {
+GOOGLE_CLIENT_EMAIL=...
+GOOGLE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+DEFAULT_CALENDAR_ID=you@gmail.com
+DEFAULT_TZ=America/Chicago
+API_SECRET=apisecret123
+*/
+const DEFAULT_CALENDAR_ID = process.env.DEFAULT_CALENDAR_ID || "";
+const DEFAULT_TZ = process.env.DEFAULT_TZ || "America/Chicago";
+const API_SECRET = process.env.API_SECRET || "";
+
+/* ========= MIDDLEWARE ========= */
+function requireSecret(req, res, next) {
   if (!API_SECRET) return next();
   if (req.headers["x-api-key"] === API_SECRET) return next();
-  return next({ status: 401, message: "unauthorized" });
+  return res.status(401).json({ error: "unauthorized" });
 }
 
-/* ============= GOOGLE AUTH ============= */
+/* ========= GOOGLE AUTH ========= */
 function getAuth() {
   const clientEmail = process.env.GOOGLE_CLIENT_EMAIL;
-  let privateKey    = process.env.GOOGLE_PRIVATE_KEY || "";
+  let privateKey = process.env.GOOGLE_PRIVATE_KEY || "";
 
-  if (!privateKey || !clientEmail) {
-    throw new Error("Google credentials missing. Set GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY.");
+  if (!clientEmail || !privateKey) {
+    throw new Error("Missing GOOGLE_CLIENT_EMAIL or GOOGLE_PRIVATE_KEY");
   }
+  // allow \n in env strings
   privateKey = privateKey.replace(/\\n/g, "\n");
 
-  return new google.auth.JWT(clientEmail, null, privateKey, [
-    "https://www.googleapis.com/auth/calendar",
-  ]);
+  return new google.auth.JWT(
+    clientEmail,
+    null,
+    privateKey,
+    ["https://www.googleapis.com/auth/calendar"]
+  );
 }
 
-/* ============= HELPERS ============= */
+/* ========= HELPERS ========= */
 function toISO(v) {
   if (!v) return undefined;
-  if (/^\d{13}$/.test(String(v))) return new Date(Number(v)).toISOString(); // epoch ms
+  if (/^\d{13}$/.test(String(v))) return new Date(Number(v)).toISOString();
   return new Date(v).toISOString();
 }
 
-function isEmail(s) {
-  return typeof s === "string" && /\S+@\S+\.\S+/.test(s);
-}
-
-/**
- * Find free slots using FreeBusy combined with a business-hours window.
- * - 09:00–17:00 local business hours
- * - No slots in the past
- */
+// Build free slots inside business hours, skipping anything in the past.
 async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots }) {
   const auth = getAuth();
   const calendar = google.calendar({ version: "v3", auth });
@@ -62,33 +67,34 @@ async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots
       timeMin: fromISO,
       timeMax: toISO,
       timeZone: tz,
-      items: [{ id: calendarId }],
-    },
+      items: [{ id: calendarId }]
+    }
   });
 
   const busy = (fb.data.calendars?.[calendarId]?.busy || [])
-    .map((b) => ({ start: b.start, end: b.end }))
+    .map(b => ({ start: b.start, end: b.end }))
     .sort((a, b) => new Date(a.start) - new Date(b.start));
 
-  const workStart = "09:00";
-  const workEnd   = "17:00";
+  const workStart = "09:00"; // 9 AM local
+  const workEnd = "17:00";   // 5 PM local
 
   const slots = [];
   let cursor = dayjs(fromISO);
-  const end = dayjs(toISO);
+  const windowEnd = dayjs(toISO);
 
-  while (cursor.isBefore(end) && slots.length < maxSlots) {
+  while (cursor.isBefore(windowEnd) && slots.length < maxSlots) {
     const dayLocal = cursor.tz(tz);
     const dayStart = dayjs.tz(`${dayLocal.format("YYYY-MM-DD")}T${workStart}`, tz).utc();
-    const dayEnd   = dayjs.tz(`${dayLocal.format("YYYY-MM-DD")}T${workEnd}`, tz).utc();
+    const dayEnd = dayjs.tz(`${dayLocal.format("YYYY-MM-DD")}T${workEnd}`, tz).utc();
 
     if (dayEnd.isAfter(dayjs(fromISO))) {
       let windowStart = dayStart;
 
       const todaysBusy = busy.filter(
-        (b) => dayjs(b.end).isAfter(dayStart) && dayjs(b.start).isBefore(dayEnd)
+        b => dayjs(b.end).isAfter(dayStart) && dayjs(b.start).isBefore(dayEnd)
       );
 
+      // gaps before each busy block
       for (const b of todaysBusy) {
         const bStart = dayjs(b.start);
         const bEnd = dayjs(b.end);
@@ -104,11 +110,11 @@ async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots
             slotStart = slotStart.add(durationMin, "minute");
           }
         }
-
         if (bEnd.isAfter(windowStart)) windowStart = bEnd;
         if (slots.length >= maxSlots) break;
       }
 
+      // tail after last busy block to day end
       if (slots.length < maxSlots && windowStart.isBefore(dayEnd)) {
         let slotStart = windowStart;
         while (slotStart.add(durationMin, "minute").isSameOrBefore(dayEnd)) {
@@ -128,11 +134,13 @@ async function findSlots({ calendarId, fromISO, toISO, tz, durationMin, maxSlots
   return slots;
 }
 
-/* ============= ROUTES ============= */
+/* ========= ROUTES ========= */
 
+// Health
 app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-app.get("/api/debug-env", requireSecret, (_req, res) => {
+// Quick debug (protected)
+app.get("/api/debug-env", requireSecret, (req, res) => {
   const keyRaw = process.env.GOOGLE_PRIVATE_KEY || "";
   res.json({
     hasEmail: !!process.env.GOOGLE_CLIENT_EMAIL,
@@ -140,37 +148,38 @@ app.get("/api/debug-env", requireSecret, (_req, res) => {
     startsWith: keyRaw.slice(0, 30).replace(/\n/g, "\\n"),
     hasEscapedN: keyRaw.includes("\\n"),
     defaultCal: DEFAULT_CALENDAR_ID,
-    defaultTz: DEFAULT_TZ,
+    defaultTz: DEFAULT_TZ
   });
 });
 
 // GET /api/free-slots?calendarId=&from=&to=&tz=&duration=30&limit=12
+// Defaults: today -> +14 days in America/Chicago
 app.get("/api/free-slots", requireSecret, async (req, res) => {
   try {
-    const calendarId  = req.query.calendarId || DEFAULT_CALENDAR_ID;
+    const calendarId = req.query.calendarId || DEFAULT_CALENDAR_ID;
     if (!calendarId) return res.status(400).json({ error: "missing calendarId" });
 
-    const tz          = req.query.tz || DEFAULT_TZ;
+    const tz = req.query.tz || DEFAULT_TZ;
     const durationMin = Number(req.query.duration || 30);
-    const maxSlots    = Number(req.query.limit || 12);
+    const limit = Number(req.query.limit || 12);
 
-    // today (in TZ) -> +14d window unless overridden
     let fromISO = toISO(req.query.from);
-    let toISOv  = toISO(req.query.to);
-    if (!fromISO || !toISOv) {
+    let toISOVal = toISO(req.query.to);
+
+    if (!fromISO || !toISOVal) {
       const startLocal = dayjs().tz(tz).startOf("day");
-      const endLocal   = startLocal.add(14, "day").endOf("day");
+      const endLocal = startLocal.add(14, "day").endOf("day"); // adjust range as you wish
       fromISO = startLocal.utc().toISOString();
-      toISOv  = endLocal.utc().toISOString();
+      toISOVal = endLocal.utc().toISOString();
     }
 
     const slots = await findSlots({
       calendarId,
       fromISO,
-      toISO: toISOv,
+      toISO: toISOVal,
       tz,
       durationMin,
-      maxSlots,
+      maxSlots: limit
     });
 
     res.json({ slots, tz, durationMin });
@@ -180,34 +189,18 @@ app.get("/api/free-slots", requireSecret, async (req, res) => {
   }
 });
 
-// POST /api/book
-// body: { calendarId?, start, end, tz?, summary?, description?, attendees? }
+// POST /api/book { calendarId, start, end, tz, summary, description }
+// No attendees (avoids service-account invite restrictions)
 app.post("/api/book", requireSecret, async (req, res) => {
   try {
     const {
       calendarId = DEFAULT_CALENDAR_ID,
       start,
       end,
-      tz         = DEFAULT_TZ,
-      summary    = "Financial Planning Consultation",
-      description = "",
-      metadata = {}, // optional { email, first_name, last_name }
+      tz = DEFAULT_TZ,
+      summary = "Financial Planning Consultation",
+      description = ""
     } = req.body || {};
-
-    // attendees may arrive as array or JSON-string; normalize
-    let attendees = req.body?.attendees ?? [];
-    if (typeof attendees === "string") {
-      try { attendees = JSON.parse(attendees); } catch { attendees = []; }
-    }
-    if (!Array.isArray(attendees)) attendees = [];
-
-    // Fallback to metadata if attendees empty and email present
-    if (!attendees.length && isEmail(metadata.email)) {
-      attendees.push({
-        email: metadata.email,
-        displayName: [metadata.first_name, metadata.last_name].filter(Boolean).join(" ").trim(),
-      });
-    }
 
     if (!calendarId || !start || !end) {
       return res.status(400).json({ error: "calendarId, start, end are required" });
@@ -218,32 +211,21 @@ app.post("/api/book", requireSecret, async (req, res) => {
 
     const event = await calendar.events.insert({
       calendarId,
-      sendUpdates: "all",
+      sendUpdates: "none", // do not attempt to email anyone
       requestBody: {
         summary,
         description,
         start: { dateTime: toISO(start), timeZone: tz },
         end:   { dateTime: toISO(end),   timeZone: tz },
-        attendees,                        // <- guests
-        reminders: { useDefault: true },
-      },
+        reminders: { useDefault: true }
+      }
     });
 
-    res.json({
-      ok: true,
-      event: event.data,
-      eventLink: event.data?.htmlLink || null,
-    });
+    res.status(200).json({ ok: true, event: event.data });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message || "book error" });
   }
-});
-
-/* ============= ERROR HANDLER ============= */
-app.use((err, _req, res, _next) => {
-  const code = err?.status || 500;
-  res.status(code).json({ error: err?.message || "server_error" });
 });
 
 export default app;
